@@ -1,0 +1,108 @@
+gz_ros2_control:
+  ros__parameters:
+    position_proportional_gain: 500.0
+
+controller_manager:
+  ros__parameters:
+    update_rate: 1000
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+    joint_trajectory_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+    cartesian_impedance_controller:
+      type: arm_controllers/CartesianImpedanceController
+    joint_position_example_controller:
+      type: franka_example_controllers/JointPositionExampleController
+    joint_position_controller:
+      type: arm_controllers/JointPositionExampleController
+    joint_effort_controller:
+      type: arm_controllers/JointEffortController
+    joint_impedance_example_controller:
+      type: franka_example_controllers/JointImpedanceExampleController
+    gravity_compensation_example_controller:
+      type: franka_example_controllers/GravityCompensationExampleController
+
+joint_trajectory_controller:
+  ros__parameters:
+    joints:
+      - fr3_joint1
+      - fr3_joint2
+      - fr3_joint3
+      - fr3_joint4
+      - fr3_joint5
+      - fr3_joint6
+      - fr3_joint7
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    state_publish_rate: 100.0
+    action_monitor_rate: 20.0
+    allow_partial_joints_goal: false
+
+joint_position_controller:
+  ros__parameters:
+    gazebo: true
+
+joint_position_example_controller_own:
+  ros__parameters:
+    gazebo: true
+
+joint_impedance_example_controller:
+  ros__parameters:
+    gazebo: true
+    robot_type: "fr3"
+    k_gains:
+      - 24.0
+      - 24.0
+      - 24.0
+      - 24.0
+      - 10.0
+      - 6.0
+      - 2.0
+    d_gains:
+      - 2.0
+      - 2.0
+      - 2.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 0.5
+
+gravity_compensation_example_controller:
+  ros__parameters:
+    robot_type: "fr3"
+    gazebo: true
+
+joint_effort_controller:
+  ros__parameters:
+    joints:
+      - fr3_joint1
+      - fr3_joint2
+      - fr3_joint3
+      - fr3_joint4
+      - fr3_joint5
+      - fr3_joint6
+      - fr3_joint7
+
+cartesian_impedance_controller:
+  ros__parameters:
+    joints:
+      - fr3_joint1
+      - fr3_joint2
+      - fr3_joint3
+      - fr3_joint4
+      - fr3_joint5
+      - fr3_joint6
+      - fr3_joint7
+    end_effector_frame: fr3_link8
+    stiffness:      [500.0, 500.0, 500.0, 30.0, 30.0, 30.0]
+    damping:        [40.0,  40.0,  40.0,  5.0,  5.0,  5.0]
+    force_gain:     [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    null_stiffness: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    null_target:    [0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854]
+    lambda_base:     0.000001
+    lambda_max:      0.01
+    sigma_threshold: 0.1
+    dq_filter_alpha: 0.1
