@@ -8,6 +8,7 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
 import pinocchio as pin
 
+
 # ===================== CBF =====================
 
 def cbf_h(q, model, data, obs_center, obs_radius):
@@ -21,7 +22,7 @@ def cbf_h(q, model, data, obs_center, obs_radius):
     pairs = [(f1, f2), (f2, ee)]
 
     obs = np.array(obs_center)
-    min_h = 1e9
+    h_min = 1e9
 
     for a, b in pairs:
         p1 = data.oMf[a].translation[[0, 2]]
@@ -33,9 +34,9 @@ def cbf_h(q, model, data, obs_center, obs_radius):
         t = np.clip(np.dot(w, v) / (np.dot(v, v) + 1e-9), 0, 1)
         dist = np.linalg.norm(w - t * v) - obs_radius
 
-        min_h = min(min_h, dist)
+        h_min = min(h_min, dist)
 
-    return min_h
+    return h_min
 
 
 def cbf_grad(q, model, data, obs_center, obs_radius, eps=1e-3):
@@ -59,15 +60,10 @@ def cbf_project(q, dq, model, data, obs_center, obs_radius, alpha=0.5):
 
     cbf_val = np.dot(g, dq) + alpha * h
 
-    correction = 0.0
-    active = False
-
     if cbf_val < 0:
-        correction = cbf_val / (np.dot(g, g) + 1e-9)
-        dq = dq - correction * g
-        active = True
+        dq = dq - (cbf_val / (np.dot(g, g) + 1e-9)) * g
 
-    return dq, h, active, correction
+    return dq, h
 
 
 # ===================== CONTROLLER =====================
@@ -95,12 +91,12 @@ class Controller(Node):
 
         self.dt = 0.01
 
-        # SAFE GAINS
-        self.Kp = 0.25
-        self.Kd = 0.12
+        # SAFE GAINS (reduced intentionally)
+        self.Kp = 0.2
+        self.Kd = 0.1
 
-        self.max_dq = 0.03   # ⭐ VERY IMPORTANT (Franka-safe)
-        self.max_step = 0.01 # velocity smoothness limit
+        self.max_dq = 0.02
+        self.max_acc = 0.5   # ⭐ CRITICAL FIX
 
         self.create_subscription(PoseStamped,
                                  '/cartesian_pid/goal_pose',
@@ -117,7 +113,7 @@ class Controller(Node):
 
         self.create_timer(self.dt, self.loop)
 
-        self.get_logger().info("FRANKA SAFE PID+CBF STARTED")
+        self.get_logger().info("FRANKA SAFE CBF PID (FINAL STABLE VERSION)")
 
     # ---------- goal ----------
     def goal_cb(self, msg):
@@ -127,7 +123,7 @@ class Controller(Node):
             msg.pose.orientation.z,
             msg.pose.orientation.w
         ])
-        q = q / (np.linalg.norm(q) + 1e-9)
+        q /= np.linalg.norm(q) + 1e-9
 
         R = pin.Quaternion(q[3], q[0], q[1], q[2]).toRotationMatrix()
         t = np.array([
@@ -142,18 +138,12 @@ class Controller(Node):
     def state_cb(self, msg):
         idx = {n:i for i,n in enumerate(msg.name)}
         for i in range(7):
-            name = f'fr3_joint{i+1}'
-            if name in idx:
-                self.q[i] = msg.position[idx[name]]
+            n = f'fr3_joint{i+1}'
+            if n in idx:
+                self.q[i] = msg.position[idx[n]]
         self.state_ok = True
 
-    # ---------- STOP SAFE ----------
-    def send_zero(self):
-        msg = Float64MultiArray()
-        msg.data = [0.0]*7
-        self.pub.publish(msg)
-
-    # ---------- MAIN LOOP ----------
+    # ---------- loop ----------
     def loop(self):
 
         if not self.state_ok or self.x_des is None:
@@ -179,24 +169,25 @@ class Controller(Node):
 
         xdot = Jp @ qdot
 
-        # PID
+        # ---------- PID ----------
         v = self.Kp * e - self.Kd * xdot
 
         dq = Jp.T @ np.linalg.inv(Jp @ Jp.T + 1e-4*np.eye(3)) @ v
 
-        # CBF
-        dq, h, active, corr = cbf_project(
+        # ---------- CBF FIRST ----------
+        dq, h = cbf_project(
             self.q, dq,
             self.model, self.data,
             self.obs, self.obs_r
         )
 
-        # HARD SAFETY LIMIT
+        # ---------- HARD LIMIT ----------
         dq = np.clip(dq, -self.max_dq, self.max_dq)
 
-        # ⭐ SMOOTHING (VERY IMPORTANT FIX)
-        dq = np.clip(dq, self.dq_prev - self.max_step,
-                          self.dq_prev + self.max_step)
+        # ---------- ACCELERATION CONSISTENCY (CRITICAL FIX) ----------
+        dq = np.clip(dq,
+                     self.dq_prev - self.max_acc * self.dt,
+                     self.dq_prev + self.max_acc * self.dt)
 
         self.dq_prev = dq.copy()
 
@@ -204,9 +195,13 @@ class Controller(Node):
         msg.data = dq.tolist()
         self.pub.publish(msg)
 
-        self.get_logger().info(
-            f"h={h:.3f} | cbf={active} | corr={corr:.4f}"
-        )
+        self.get_logger().info(f"h={h:.3f}")
+
+
+    def send_zero(self):
+        msg = Float64MultiArray()
+        msg.data = [0.0]*7
+        self.pub.publish(msg)
 
 
 def main():
@@ -216,7 +211,7 @@ def main():
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info("STOPPING SAFELY")
+        node.get_logger().info("STOP")
     finally:
         node.send_zero()
         node.send_zero()
