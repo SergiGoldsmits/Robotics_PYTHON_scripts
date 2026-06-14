@@ -181,7 +181,7 @@ class CartesianCBFController(Node):
         self.ddq_max = np.array([7.5, 12.5, 20.0]) / 1.1
 
         # --- CBF filter ---
-        self.lambda_cbf = 75.0                          # class-K gain (conservativeness, NOT safety)
+        self.lambda_cbf = 7.5                          # class-K gain (conservativeness, NOT safety)
         self.beta = 15.0
         self.grad_clip = 40.0
 
