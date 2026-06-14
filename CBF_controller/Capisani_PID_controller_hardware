@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""
+Capisani-CBF velocity-level safety filter for the FRANKA FR3 (planar XZ).
+
+Filter (PDF eqs. 6-8):
+    v_cmd = argmin_v 1/2||v - v_pid||^2  s.t.  grad(h)^T v + lambda*h >= 0
+
+BARRIER (Capisani angular barrier, used directly):
+    h(q) = min over links of [ diff_i^2 - sign(delta_i)*delta_i^2 ]      (>0 = safe)
+    Cases A/B (delta>=0): h_i = diff^2 - delta^2 (paper, unchanged).
+    Case C (link too short, empty cone): delta continued negative via -arccosh; signed
+    square -> h_i = diff^2 + delta^2 > 0. C^1 across delta=0.
+
+ESCAPE (deadlock breaker): when the filter blocks (cstr<0) the nominal is augmented by an
+    upward tangential climb; latched with hysteresis (engage cstr<0, release cstr>release).
+    The escape only enters the NOMINAL -- the QP below still certifies safety, so the
+    guarantee is bias-independent.
+
+SAFETY FILTER  ---  CHANGED vs earlier revisions  ----------------------------------------
+    The CBF projection AND the actuator limits are now solved together in a single QP
+
+        min 1/2||dq - dq_nom||^2
+        s.t.  grad(h)^T dq >= -lambda*h            (CBF / forward invariance)
+              lb <= dq <= ub                       (saturation AND slew/accel limit)
+
+    so the command that is PUBLISHED is exactly the command that is certified. The old
+    code projected first and then clamped acceleration afterwards; that post-projection
+    clamp sat OUTSIDE the certificate and let h dip below 0 (the realised dq was a lagged
+    version of the certified dq). Folding the bound into the QP removes that gap. If the
+    slew box is too tight to satisfy the CBF in a given tick, the QP is infeasible: it then
+    returns the best-effort safest command within the limits and flags `feasible=False`
+    (a genuine physical limit, not a code bug -- mitigate with smaller lambda / larger
+    r_eff so braking starts earlier).
+
+Numerical hygiene: softmin over links, central-difference gradient, gradient clip.
+ROS interface unchanged.
+"""
+
+import rclpy
+from rclpy.node import Node
+import numpy as np
+from geometry_msgs.msg import PoseStamped
+from sensor_msgs.msg import JointState
+from std_msgs.msg import Float64MultiArray, String
+import pinocchio as pin
+import csv
+import time
+
+ACTIVE = [1, 3, 5]                 # planar joints (fr3_joint2, 4, 6) -> XZ motion
+TASK_ROWS = [0, 2]                 # X, Z rows of the 6xN Jacobian
+LINK_SEGMENTS = [('fr3_link3', 'fr3_link4'), ('fr3_link4', 'fr3_link5'),
+                 ('fr3_link5', 'fr3_link6'), ('fr3_link6', 'fr3_link7'),
+                 ('fr3_link7', 'fr3_link8')]
+
+
+# =============================================================================
+#  Capisani angular barrier
+# =============================================================================
+def capisani_delta(p_base, p_end, obs_center, r_eff):
+    """Capisani forbidden-cone half-width delta_i and signed angular offset
+    diff_i = (Q_i - Q_i^W). Cases A/B per the paper; Case C continued negative via
+    -arccosh (empty cone, link cannot reach), C^1 across the boundary."""
+    x_b, z_b = p_base[0], p_base[2]
+    x_e, z_e = p_end[0], p_end[2]
+    l_i = np.hypot(x_e - x_b, z_e - z_b)
+    d_i = np.hypot(obs_center[0] - x_b, obs_center[1] - z_b)
+
+    if d_i <= r_eff:                                                   # base inside obstacle
+        delta_i = np.pi / 2.0
+    elif l_i * l_i >= (d_i * d_i - r_eff * r_eff):                     # Case A : tangent
+        delta_i = np.arcsin(np.clip(r_eff / d_i, -1.0, 1.0))
+    else:                                                             # Case B / Case C
+        denom = 2.0 * d_i * l_i
+        val = (l_i * l_i + d_i * d_i - r_eff * r_eff) / denom if denom > 1e-9 else 1.0
+        if val <= 1.0:
+            delta_i = np.arccos(np.clip(val, -1.0, 1.0))              # Case B
+        else:
+            delta_i = -np.arccosh(val)                                # Case C (empty cone)
+
+    q_w = np.arctan2(obs_center[1] - z_b, obs_center[0] - x_b)         # critical angle Q_i^W
+    q_l = np.arctan2(z_e - z_b, x_e - x_b)                             # actual link angle Q_i
+    diff = np.arctan2(np.sin(q_l - q_w), np.cos(q_l - q_w))            # wrapped (Q_i - Q_i^W)
+    return diff, delta_i
+
+
+def _link_barriers(q_full, model, data, obs_center, r_eff):
+    """Per-link  h_i = diff_i^2 - sign(delta_i)*delta_i^2  (>0 = safe)."""
+    pin.forwardKinematics(model, data, q_full)
+    pin.framesForwardKinematics(model, data, q_full)
+    hs = []
+    for bf, ef in LINK_SEGMENTS:
+        pb = data.oMf[model.getFrameId(bf)].translation
+        pe = data.oMf[model.getFrameId(ef)].translation
+        diff, delta = capisani_delta(pb, pe, obs_center, r_eff)
+        hs.append(diff * diff - np.copysign(delta * delta, delta))
+    return np.array(hs) if hs else np.array([1e3])
+
+
+def _soft_min(h, beta):
+    """Smooth (C^inf) under-estimate of min(h): differentiable 'min over links'."""
+    m = float(np.min(h))
+    return m - (1.0 / beta) * np.log(np.sum(np.exp(-beta * (h - m))))
+
+
+def h_and_grad(q_full, model, obs_center, r_eff, beta=15.0, eps=1e-4):
+    """Barrier value h(q) and gradient grad(h) w.r.t. the 3 active joints."""
+    h0 = _soft_min(_link_barriers(q_full, model, model.createData(),
+                                  obs_center, r_eff), beta)
+    g = np.zeros(len(ACTIVE))
+    for k, j in enumerate(ACTIVE):
+        qp = q_full.copy(); qp[j] += eps
+        qm = q_full.copy(); qm[j] -= eps
+        hp = _soft_min(_link_barriers(qp, model, model.createData(), obs_center, r_eff), beta)
+        hm = _soft_min(_link_barriers(qm, model, model.createData(), obs_center, r_eff), beta)
+        g[k] = (hp - hm) / (2.0 * eps)
+    return h0, g
+
+
+# =============================================================================
+#  Safety QP:  min 1/2||dq-dq_nom||^2  s.t.  a.dq >= b,  lb <= dq <= ub
+#  Exact for a box plus ONE linear inequality, via the scalar dual.
+#  KKT: dq_i = clip(dq_nom_i + mu*a_i, lb_i, ub_i), mu>=0, found by a monotone
+#  1-D root solve of  a.dq(mu) = b  (a.dq is non-decreasing in mu).
+# =============================================================================
+def safety_qp(dq_nom, a, b, lb, ub, n_iter=60):
+    """Returns (dq, active, feasible)."""
+    dq = np.clip(dq_nom, lb, ub)
+    if float(a @ dq) >= b:                         # box projection already CBF-safe
+        return dq, False, True
+    if float(a @ a) < 1e-12:                        # no usable gradient
+        return dq, False, False
+
+    def adq(mu):
+        return float(a @ np.clip(dq_nom + mu * a, lb, ub))
+
+    lo, hi, it = 0.0, 1.0, 0
+    while adq(hi) < b and hi < 1e9:                 # bracket the root
+        hi *= 2.0; it += 1
+        if it > 80:
+            break
+    feasible = adq(hi) >= b
+    for _ in range(n_iter):                         # bisection (a.dq monotone in mu)
+        mid = 0.5 * (lo + hi)
+        if adq(mid) < b:
+            lo = mid
+        else:
+            hi = mid
+    dq = np.clip(dq_nom + hi * a, lb, ub)
+    return dq, True, feasible
+
+
+# =============================================================================
+#  Controller node
+# =============================================================================
+class CartesianCBFController(Node):
+    def __init__(self):
+        super().__init__('cartesian_cbf_controller')
+        self.model = pin.buildModelFromUrdf('/tmp/fr3_resolved.urdf')
+        self.data = self.model.createData()
+        self.ee_frame_id = self.model.getFrameId('fr3_link8')
+
+        # --- obstacle ---
+        self.obs_center = np.array([0.45, 0.25])
+        self.obs_radius = 0.06
+        self.link_buffer = 0.025
+        self.r_eff = self.obs_radius + self.link_buffer
+
+        # --- state ---
+        self.q = np.zeros(7)
+        self.state_received = False
+        self.x_des = None
+        self.dq_prev = np.zeros(3)
+
+        # --- nominal (PID) controller ---
+        self.dt = 0.01
+        self.Kp = 10.0
+        self.v_max_task = 0.25
+        self.max_dq = 1.5                              # joint velocity saturation [rad/s]
+
+        # --- actuator acceleration limits for [q2,q4,q6] [rad/s^2], with safety factor ---
+        self.ddq_max = np.array([7.5, 12.5, 20.0]) / 1.1
+
+        # --- CBF filter ---
+        self.lambda_cbf = 75.0                          # class-K gain (conservativeness, NOT safety)
+        self.beta = 15.0
+        self.grad_clip = 40.0
+
+        # --- tangential escape (over-the-top deadlock breaker) ---
+        self.k_esc = 0.15
+        self.cstr_release = 0.20
+        self.escaping = False                          # hysteresis latch (binary; reset per goal)
+
+        # --- data logging ---
+        self.start_time = time.time()
+        self.csv_filename = '/tmp/cbf_trajectory_data.csv'
+        with open(self.csv_filename, mode='w', newline='') as f:
+            csv.writer(f).writerow([
+                'timestamp', 'x_ee', 'z_ee', 'h', 'cstr', 'escaping', 'feasible',
+                'correction_mag', 'q0', 'q1', 'q2', 'dq0', 'dq1', 'dq2',
+                'ddq0', 'ddq1', 'ddq2'])
+
+        # --- ROS I/O ---
+        self.vel_pub = self.create_publisher(
+            Float64MultiArray, '/joint_velocity_example_controller/commands', 10)
+        self.status_pub = self.create_publisher(String, '/cbf_status', 10)
+        self.create_subscription(PoseStamped, '/cartesian_pid/goal_pose',
+                                 self.goal_callback, 10)
+        self.create_subscription(JointState, '/franka/joint_states',
+                                 self.joint_state_callback, 10)
+        self.timer = self.create_timer(self.dt, self.control_loop)
+
+    # ----- callbacks ----------------------------------------------------------
+    def goal_callback(self, msg):
+        t = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
+        o = np.array([msg.pose.orientation.x, msg.pose.orientation.y,
+                      msg.pose.orientation.z, msg.pose.orientation.w])
+        n = np.linalg.norm(o)
+        o = o / n if n > 1e-6 else np.array([0., 0., 0., 1.])
+        self.x_des = pin.SE3(pin.Quaternion(o[3], o[0], o[1], o[2]).toRotationMatrix(), t)
+        self.escaping = False                          # fresh goal -> clear the latch
+
+    def joint_state_callback(self, msg):
+        name_to_idx = {n: i for i, n in enumerate(msg.name)}
+        for i, j in enumerate([f'fr3_joint{k}' for k in range(1, 8)]):
+            if j in name_to_idx:
+                self.q[i] = msg.position[name_to_idx[j]]
+        self.state_received = True
+
+    # ----- main loop ----------------------------------------------------------
+    def control_loop(self):
+        if not self.state_received or self.x_des is None:
+            return
+
+        pin.forwardKinematics(self.model, self.data, self.q)
+        pin.framesForwardKinematics(self.model, self.data, self.q)
+
+        J = pin.computeFrameJacobian(self.model, self.data, self.q, self.ee_frame_id,
+                                     pin.LOCAL_WORLD_ALIGNED)[np.ix_(TASK_ROWS, ACTIVE)]
+        p_ee = self.data.oMf[self.ee_frame_id].translation
+        x_ee = np.array([p_ee[0], p_ee[2]])
+        x_goal = np.array([self.x_des.translation[0], self.x_des.translation[2]])
+
+        # 1) nominal task-space P control -> joint velocity (damped least squares)
+        e = x_goal - x_ee
+        v_pid = self.Kp * e
+        sp = np.linalg.norm(v_pid)
+        if sp > self.v_max_task:
+            v_pid = v_pid * (self.v_max_task / sp)
+        ld = 0.05
+        Jinv = J.T @ np.linalg.inv(J @ J.T + ld * ld * np.eye(2))
+        dq_nom = Jinv @ v_pid
+        dq_nom_pure = dq_nom.copy()                    # snapshot for correction_mag
+
+        # 2) barrier value + gradient (clipped at the arcsin singularity)
+        h, g = h_and_grad(self.q, self.model, self.obs_center, self.r_eff, self.beta)
+        gn = np.linalg.norm(g)
+        if gn > self.grad_clip:
+            g = g * (self.grad_clip / gn)
+
+        # 3) tangential ESCAPE latch (enters the NOMINAL only)
+        cstr_reach = float(g @ dq_nom + self.lambda_cbf * h)
+        if cstr_reach < 0.0:
+            self.escaping = True
+        elif cstr_reach > self.cstr_release:
+            self.escaping = False
+        if self.escaping:
+            g_task = np.linalg.pinv(J.T) @ g           # grad(h) in (X, Z)
+            t = np.array([-g_task[1], g_task[0]])      # rotate +90 deg
+            nt = np.linalg.norm(t)
+            if nt > 1e-9:
+                if t[1] < 0.0:
+                    t = -t                             # upward branch
+                v_esc = self.k_esc * t / nt
+                dq_nom = dq_nom + J.T @ np.linalg.inv(J @ J.T + 1e-3 * np.eye(2)) @ v_esc
+
+        # 4) SINGLE safety QP: CBF constraint + actuator box (saturation AND slew)
+        #    -> the published command equals the certified command.
+        slew = self.ddq_max * self.dt
+        lb = np.maximum(-self.max_dq, self.dq_prev - slew)
+        ub = np.minimum( self.max_dq, self.dq_prev + slew)
+        a = g
+        b = -self.lambda_cbf * h
+        dq, active, feasible = safety_qp(dq_nom, a, b, lb, ub)
+
+        # 5) publish
+        ddq = (dq - self.dq_prev) / self.dt
+        cstr_pub = float(g @ dq + self.lambda_cbf * h)         # realised constraint value
+        correction_mag = float(np.linalg.norm(dq - dq_nom_pure))
+        self.dq_prev = dq
+
+        final = np.zeros(7)
+        final[ACTIVE] = dq
+        self.vel_pub.publish(Float64MultiArray(data=final.tolist()))
+
+        elapsed = time.time() - self.start_time
+        with open(self.csv_filename, mode='a', newline='') as f:
+            csv.writer(f).writerow([
+                elapsed, x_ee[0], x_ee[1], h, cstr_pub, int(self.escaping), int(feasible),
+                correction_mag, self.q[ACTIVE[0]], self.q[ACTIVE[1]], self.q[ACTIVE[2]],
+                dq[0], dq[1], dq[2], ddq[0], ddq[1], ddq[2]])
+
+        self.status_pub.publish(String(
+            data=(f"x={x_ee[0]:+.3f} z={x_ee[1]:+.3f} h={h:+.4f} cstr={cstr_pub:+.4f} "
+                  f"esc={int(self.escaping)} feas={int(feasible)} "
+                  f"|e|={np.linalg.norm(e):.3f} |dq|={np.linalg.norm(dq):.3f}")))
+
+
+def main():
+    rclpy.init()
+    rclpy.spin(CartesianCBFController())
+
+
+if __name__ == '__main__':
+    main()
