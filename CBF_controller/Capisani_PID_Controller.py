@@ -34,6 +34,8 @@ from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray, String
 import pinocchio as pin
+import csv
+import time
 
 ACTIVE = [1, 3, 5]                 # planar joints (fr3_joint2, 4, 6) -> XZ motion
 TASK_ROWS = [0, 2]                 # X, Z rows of the 6xN Jacobian
@@ -118,7 +120,7 @@ class CartesianCBFController(Node):
         # --- obstacle ---
         self.obs_center = np.array([0.45, 0.25])
         self.obs_radius = 0.06
-        self.link_buffer = 0.0150
+        self.link_buffer = 0.025
         self.r_eff = self.obs_radius + self.link_buffer
 
         # --- state ---
@@ -129,23 +131,35 @@ class CartesianCBFController(Node):
 
         # --- nominal (PID) controller ---
         self.dt = 0.01
-        self.Kp = 2.0
+        self.Kp = 10.0
         self.v_max_task = 0.25
-        self.max_dq = 0.8
+        self.max_dq = 1.5
 
         # --- CBF filter ---
-        self.lambda_cbf = 4.0
+        self.lambda_cbf = 7.5
         self.kappa = 1.0
         self.beta = 15.0
         self.grad_clip = 40.0
 
         # --- tangential escape (joint-space, over-the-top) ---
         self.k_esc = 0.15               # upward tangential climb speed
-        self.k_out = 0.15              # outward push along +grad(h) (guarantees crest)
+        self.k_out = 0.15             # outward push along +grad(h) (guarantees crest)
         self.cstr_release = 0.20          # release the climb once h exceeds this margin
         self.escaping = False          # hysteresis latch (reset on each new goal)
 
         self.lpf_alpha = 1.0           # 1.0 = no output smoothing
+
+        # --- data logging file initialization ---
+        self.start_time = time.time()
+        self.csv_filename = '/tmp/cbf_trajectory_data.csv'
+        with open(self.csv_filename, mode='w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'timestamp', 'x_ee', 'z_ee', 'h', 'cstr', 'escaping', 'correction_mag',
+                'q0', 'q1', 'q2',
+                'dq0', 'dq1', 'dq2',
+                'ddq0', 'ddq1', 'ddq2'
+            ])
 
         # --- ROS I/O ---
         self.vel_pub = self.create_publisher(
@@ -198,6 +212,9 @@ class CartesianCBFController(Node):
         Jinv = J.T @ np.linalg.inv(J @ J.T + lam * lam * np.eye(2))
         dq_nom = Jinv @ v_pid
 
+        # Keep an exact snapshot of original dq_nom before tracking/escape manipulations
+        dq_nom_pure = dq_nom.copy()
+
         # 2) barrier value + gradient
         h, g = h_and_grad(self.q, self.model, self.obs_center, self.r_eff, self.beta)
         gn = np.linalg.norm(g)
@@ -227,14 +244,31 @@ class CartesianCBFController(Node):
                 dq_nom = dq_nom + J.T @ np.linalg.inv(J @ J.T + 1e-3 * np.eye(2)) @ v_esc
             cstr = float(g @ dq_nom + self.lambda_cbf * h)    # re-evaluate
 
+        # =============================================================================
+        # 3) CBF PROJECTION (Strict, final joint-space safety enforcement)
+        # =============================================================================
         dq = dq_nom.copy()
-        if cstr < 0.0:                                        # project onto constraint boundary
-            dq = dq_nom - self.kappa * (cstr / (g @ g + 1e-9)) * g
+        
+        if cstr < 0.0 or self.escaping:
+            # If escaping and cstr happens to be positive, force a minimum safety push margin
+            effective_cstr = min(cstr, -0.01) if self.escaping else cstr
+            dq = dq_nom - self.kappa * (effective_cstr / gg) * g
+        # =============================================================================
 
-        # 3) CBF projection (certifies h>=0 for the nominal in use)
-        dq = dq_nom.copy()
-        if cstr < 0.0:
-            dq = dq_nom - self.kappa * (cstr / gg) * g
+        # --- Kinematic Data Tracking Transformations (No Logic Alternation) ---
+        ddq = (dq - self.dq_prev) / self.dt
+        correction_mag = float(np.linalg.norm(dq - dq_nom_pure))
+
+        # --- append state metrics to the csv logger file ---
+        elapsed = time.time() - self.start_time
+        with open(self.csv_filename, mode='a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                elapsed, x_ee[0], x_ee[1], h, cstr, int(self.escaping), correction_mag,
+                self.q[ACTIVE[0]], self.q[ACTIVE[1]], self.q[ACTIVE[2]],
+                dq[0], dq[1], dq[2],
+                ddq[0], ddq[1], ddq[2]
+            ])
 
         # 4) saturate, (optional) filter, publish
         dq = self.lpf_alpha * dq + (1.0 - self.lpf_alpha) * self.dq_prev
