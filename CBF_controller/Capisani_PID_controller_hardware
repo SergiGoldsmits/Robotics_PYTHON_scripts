@@ -177,9 +177,10 @@ class CartesianCBFController(Node):
         self.v_max_task = 0.25
         self.max_dq = 1.5                              # joint velocity saturation [rad/s]
 
-        # --- actuator acceleration limits for [q2,q4,q6] [rad/s^2], with safety factor ---
+        # --- actuator acceleration and jerk limits for [q2,q4,q6] [rad/s^2], with safety factor ---
         self.ddq_max = np.array([7.5, 12.5, 20.0]) / 1.1
-
+        self.dq_prev2 = np.zeros(3)   # second-order memory for jerk
+        self.j_max = np.array([50.0, 80.0, 120.0])  # rad/s^3 (tune!)
         # --- CBF filter ---
         self.lambda_cbf = 7.5                          # class-K gain (conservativeness, NOT safety)
         self.beta = 15.0
