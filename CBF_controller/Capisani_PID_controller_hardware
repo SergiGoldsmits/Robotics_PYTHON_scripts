@@ -8,7 +8,7 @@ Filter (PDF eqs. 6-8):
 BARRIER (Capisani angular barrier, used directly):
     h(q) = min over links of [ diff_i^2 - sign(delta_i)*delta_i^2 ]      (>0 = safe)
     Cases A/B (delta>=0): h_i = diff^2 - delta^2 (paper, unchanged).
-    Case C (link too short, empty cone): delta continued negative via -arccosh; signed
+    Case C (link too short, empty cone): delta continued positive via -arccosh; signed
     square -> h_i = diff^2 + delta^2 > 0. C^1 across delta=0.
 
 ESCAPE (deadlock breaker): when the filter blocks (cstr<0) the nominal is augmented by an
