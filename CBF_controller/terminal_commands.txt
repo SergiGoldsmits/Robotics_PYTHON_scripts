@@ -1,0 +1,21 @@
+ros2 run xacro xacro \
+  /home/sergi/ros2_ws/src/franka_ros2/franka_description/robots/fr3/fr3.urdf.xacro \
+  ros2_control:=true robot_type:=fr3 hand:=false \
+  2>/dev/null > /tmp/fr3_resolved.urdf
+
+
+# terminal 1 — simulator (publishes joint states + /robot_description + /obstacle_marker)
+python3 ~/ros2_ws/src/1.0_Thesis/arm_controllers_cpp/scripts/PID_simulation.py
+
+# terminal 2 — controller
+python3 ~/ros2_ws/src/1.0_Thesis/arm_controllers_cpp/scripts/Capisani_PID_Controller.py
+
+# terminal 3 — robot state publisher (joint states → TF for RViz)
+ros2 launch franka_description visualize_franka.launch.py \
+  robot_type:=fr3 load_gripper:=false ee_id:=fr3
+
+# terminal 4 — kill conflicting joint state publisher
+pkill -f joint_state_publisher_gui
+
+# terminal 5 — RViz (opens automatically from launch, or manually)
+ros2 run rviz2 rviz2
