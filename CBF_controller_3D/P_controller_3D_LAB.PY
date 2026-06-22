@@ -1,37 +1,8 @@
 #!/usr/bin/env python3
 """
-Capisani-CBF velocity-level safety filter for the FRANKA FR3  --  FULL 3D / 7-DOF.
-
-3D generalisation of the validated planar controller. Single CBF row (softmin over
-links) projected by a box-constrained QP; box carries velocity + acceleration + jerk.
-
-CHANGES vs the planar version
-  * Barrier: signed planar angle diff -> UNSIGNED 3D angle phi = arccos(u_link . u_obs).
-    Enters h squared, so dropping the sign is exact. h_i = phi^2 - sign(delta)*delta^2.
-    Cases A/B/C of delta are scalar (l_i, d_i, r_eff) and unchanged. New arccos
-    (anti)parallel singularity is absorbed by the gradient-norm clip.
-  * ACTIVE = all 7 joints, TASK_ROWS = X,Y,Z. 4-D null space -> posture task.
-  * Latch -> CIRCULATION field: smooth swirl around the obstacle, axis-selectable, sign
-    toward the goal, gated by exp(-h/h_act) (proximity to barrier) AND by tanh(|e|/e0)
-    (proximity to GOAL). The goal fade is what stops the EE orbiting / sign-chattering at
-    the goal: circulation should exist only while you are being BLOCKED on the way
-    somewhere, and be exactly zero once you have arrived. Enters NOMINAL only -> QP still
-    certifies safety unchanged.
-  * Null-space projector built from the TRUE pinv(J), not the damped Jinv, so the posture
-    term does not leak into task-space motion (the damped-Jinv projector had J N != 0,
-    which showed up as residual jitter near the goal). DLS is kept for the task term only.
-
-OPERATIONAL NOTE (read before running)
-  The published command must EQUAL the certified command. Any velocity/accel caps in the
-  C++ velocity_example_controller MUST be strictly LOOSER than this QP box (or removed).
-  If the low level clamps tighter, realised dq lags certified dq, g.dq_realised < -lambda*h,
-  and h dives below 0 even though the logged `cstr` stays >= 0. That cstr>=0-but-h<0
-  signature is exactly the C++ gap. The QP must be the only limiter.
-
-DIAGNOSING h < 0 from the CSV: look at `cstr`, `feasible`, `gn_raw`.
-   cstr>=0 & h<0          -> realised != commanded (C++ caps). Loosen/remove C++ caps.
-   cstr<0 & feasible==0   -> box too tight for the CBF. Lower lambda / raise r_eff.
-   cstr>=0 & gn_raw==clip -> gradient clip firing at the arccos singularity. Raise clip.
+Modified Capisani-CBF velocity-level safety filter for the FRANKA FR3  --  FULL 3D / 7-DOF.
+Bypasses the CBF filter and circulation field logic to act as a normal 3D P controller.
+Maintains calculations and logging of the barrier function (h) to observe negative values.
 """
 
 import rclpy
@@ -44,7 +15,7 @@ import pinocchio as pin
 import csv
 import time
 
-ACTIVE = list(range(7))            # all 7 joints help avoid in 3D
+ACTIVE = list(range(7))            # all 7 joints
 TASK_ROWS = [0, 1, 2]              # X, Y, Z rows of the 6xN Jacobian
 LINK_SEGMENTS = [('fr3_link3', 'fr3_link4'), ('fr3_link4', 'fr3_link5'),
                  ('fr3_link5', 'fr3_link6'), ('fr3_link6', 'fr3_link7'),
@@ -116,69 +87,6 @@ def h_and_grad(q_full, model, obs_center, r_eff, beta=15.0, eps=1e-4):
 
 
 # =============================================================================
-#  Circulation (vortex) field  --  replaces the planar latch
-# =============================================================================
-def circulation_velocity(x_ee, x_goal, obs_center, h, k_circ, h_act, axis, w_cap=3.0):
-    """Smooth swirl around the obstacle. Sign chosen toward the goal; gated by
-    exp(-h/h_act) (barrier proximity). The separate GOAL fade is applied in the loop."""
-    r_vec = np.asarray(x_ee) - np.asarray(obs_center)
-    v_swirl = np.cross(axis, r_vec)
-    nv = np.linalg.norm(v_swirl)
-    if nv < 1e-9:                                  # EE on the circulation axis -> undefined
-        return np.zeros(3)
-    v_swirl /= nv
-    if np.dot(v_swirl, np.asarray(x_goal) - np.asarray(x_ee)) < 0.0:
-        v_swirl = -v_swirl
-    w = k_circ * min(float(np.exp(-h / h_act)), w_cap)
-    return w * v_swirl
-
-
-# =============================================================================
-#  Actuator box: velocity AND acceleration AND jerk as a single box (keeps the
-#  QP closed-form). accel_prev clipped into the accel band first => lb <= ub.
-# =============================================================================
-def actuator_box(dq_prev, dq_prev2, dt, ddq_max, j_max, v_max):
-    accel_prev = np.clip((dq_prev - dq_prev2) / dt, -ddq_max, ddq_max)
-    a_lo = np.maximum(-ddq_max, accel_prev - j_max * dt)
-    a_hi = np.minimum( ddq_max, accel_prev + j_max * dt)
-    lb = np.maximum(-v_max, dq_prev + dt * a_lo)
-    ub = np.minimum( v_max, dq_prev + dt * a_hi)
-    lb = np.minimum(lb, ub)
-    return lb, ub
-
-
-# =============================================================================
-#  Safety QP:  min 1/2||dq-dq_nom||^2  s.t.  a.dq >= b,  lb <= dq <= ub
-#  Box + ONE linear inequality via the scalar dual. Dimension-agnostic.
-# =============================================================================
-def safety_qp(dq_nom, a, b, lb, ub, n_iter=60):
-    """Returns (dq, active, feasible)."""
-    dq = np.clip(dq_nom, lb, ub)
-    if float(a @ dq) >= b:
-        return dq, False, True
-    if float(a @ a) < 1e-12:
-        return dq, False, False
-
-    def adq(mu):
-        return float(a @ np.clip(dq_nom + mu * a, lb, ub))
-
-    lo, hi, it = 0.0, 1.0, 0
-    while adq(hi) < b and hi < 1e9:
-        hi *= 2.0; it += 1
-        if it > 80:
-            break
-    feasible = adq(hi) >= b
-    for _ in range(n_iter):
-        mid = 0.5 * (lo + hi)
-        if adq(mid) < b:
-            lo = mid
-        else:
-            hi = mid
-    dq = np.clip(dq_nom + hi * a, lb, ub)
-    return dq, True, feasible
-
-
-# =============================================================================
 #  Controller node
 # =============================================================================
 class CartesianCBFController(Node):
@@ -191,7 +99,7 @@ class CartesianCBFController(Node):
         # --- obstacle (3D: X, Y, Z) ---
         self.obs_center = np.array([0.45, 0.0, 0.2])
         self.obs_radius = 0.10
-        self.link_buffer = 0.10
+        self.link_buffer = 0.06
         self.r_eff = self.obs_radius + self.link_buffer
 
         # --- state ---
@@ -199,35 +107,23 @@ class CartesianCBFController(Node):
         self.state_received = False
         self.x_des = None
         self.dq_prev = np.zeros(7)
-        self.dq_prev2 = np.zeros(7)                    # second-order memory for jerk
         self.dq_filt = np.zeros(7)                     # LPF state for published command
         self.lpf_alpha = 0.3                           # 0<a<=1; lower = smoother, more lag
+
         # --- nominal (P) controller ---
         self.dt = 0.01
         self.Kp = 0.8
         self.v_max_task = 0.15
+        self.max_dq = 1.0                              # Direct joint velocity max bounds
 
         # --- null-space posture (uses the 4-D redundancy) ---
         self.q_rest = np.array([0.0, -np.pi/4, 0.0, -3*np.pi/4, 0.0, np.pi/2, np.pi/4])
         self.k_post = 1.0
 
-        # --- per-joint actuator limits [j1..j7]  (TUNE to your URDF / safety factor) ---
-        sf = 1.3
-        self.v_max   = np.array([2.62, 2.62, 2.62, 2.62, 5.26, 4.18, 5.26]) / sf
-        self.ddq_max = np.array([2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0]) / sf
-        self.j_max   = np.array([40., 40., 40., 40., 40., 40., 40.]) / sf
-
-        # --- CBF filter ---
-        self.lambda_cbf = 2.0                          # lower = brakes earlier, keeps h higher
+        # --- CBF Tracking (For monitoring purposes only) ---
+        self.lambda_cbf = 2.0                          
         self.beta = 15.0
         self.grad_clip = 40.0
-
-        # --- circulation field (replaces the latch) ---
-        self.k_circ = 0.05                             # swirl speed scale [m/s]
-        self.h_act = 0.05                              # barrier-proximity gate width (rad^2)
-        self.e0 = 0.06                                 # GOAL fade scale [m] -> kills orbit/chatter
-        axis = np.array([0.0, 0.0, 1.0])               # gravity-up -> "go around the side"
-        self.circ_axis = axis / np.linalg.norm(axis)
 
         # --- data logging ---
         self.start_time = time.time()
@@ -254,7 +150,7 @@ class CartesianCBFController(Node):
     def goal_callback(self, msg):
         self.x_des = np.array([msg.pose.position.x,
                                msg.pose.position.y,
-                               msg.pose.position.z])   # all 3 used; no latch to reset
+                               msg.pose.position.z])
 
     def joint_state_callback(self, msg):
         name_to_idx = {n: i for i, n in enumerate(msg.name)}
@@ -283,41 +179,30 @@ class CartesianCBFController(Node):
         if sp > self.v_max_task:
             v_pid = v_pid * (self.v_max_task / sp)
 
-        # 2) barrier value + gradient (record raw norm before clipping for diagnostics)
+        # 2) resolved-rate kinematics with null-space posture task
+        Jpinv_true = np.linalg.pinv(J)                               # true pinv, projector only
+        N = np.eye(7) - Jpinv_true @ J                               # Null space projector
+        dq_posture = -self.k_post * (self.q[ACTIVE] - self.q_rest)
+        
+        # We use a slight task damping for singularity management near operational limits
+        ld = 0.05
+        Jinv = J.T @ np.linalg.inv(J @ J.T + ld * ld * np.eye(3))     
+        dq_nom = Jinv @ v_pid + N @ dq_posture
+
+        # 3) Basic joint velocity saturation box constraint
+        dq = np.clip(dq_nom, -self.max_dq, self.max_dq)
+
+        # 4) Calculate barrier value + gradient purely for monitoring/logging
         h, g = h_and_grad(self.q, self.model, self.obs_center, self.r_eff, self.beta)
         gn_raw = float(np.linalg.norm(g))
         if gn_raw > self.grad_clip:
             g = g * (self.grad_clip / gn_raw)
 
-        # 3) circulation -> task velocity (NOMINAL only). Fades to 0 at the goal.
-        v_circ = circulation_velocity(x_ee, x_goal, self.obs_center, h,
-                                      self.k_circ, self.h_act, self.circ_axis)
-        goal_fade = float(np.tanh(np.linalg.norm(e) / self.e0))
-        v_circ = v_circ * goal_fade
-        v_task = v_pid + v_circ
-
-        # 4) resolved-rate: DLS for the task term, TRUE pinv for the null-space projector
-        ld = 0.05
-        Jinv = J.T @ np.linalg.inv(J @ J.T + ld * ld * np.eye(3))     # damped, task term
-        Jpinv_true = np.linalg.pinv(J)                               # true, projector only
-        N = np.eye(7) - Jpinv_true @ J                               # J N ~= 0 -> no leak
-        dq_posture = -self.k_post * (self.q[ACTIVE] - self.q_rest)
-        dq_nom = Jinv @ v_task + N @ dq_posture
-        dq_nom_pure = (Jinv @ v_pid + N @ dq_posture).copy()         # for correction_mag
-
-        # 5) SINGLE actuator-limited safety QP (vel + accel + jerk box, ONE CBF row)
-        lb, ub = actuator_box(self.dq_prev, self.dq_prev2, self.dt,
-                              self.ddq_max, self.j_max, self.v_max)
-        a = g
-        b = -self.lambda_cbf * h
-        dq, active, feasible = safety_qp(dq_nom, a, b, lb, ub)
-
-        # 6) publish
-        ddq = (dq - self.dq_prev) / self.dt
+        # Theoretical constraint margin calculation
         cstr_pub = float(g @ dq + self.lambda_cbf * h)
-        circ_mag = float(np.linalg.norm(v_circ))
-        correction_mag = float(np.linalg.norm(dq - dq_nom_pure))
-        self.dq_prev2 = self.dq_prev.copy()
+
+        # 5) Publish unmitigated P-control command
+        ddq = (dq - self.dq_prev) / self.dt
         self.dq_prev = dq.copy()
 
         self.dq_filt = self.lpf_alpha * dq + (1.0 - self.lpf_alpha) * self.dq_filt
@@ -325,17 +210,18 @@ class CartesianCBFController(Node):
         final[ACTIVE] = self.dq_filt
         self.vel_pub.publish(Float64MultiArray(data=final.tolist()))
 
+        # 6) Log metrics to watch h drop deep into negative territory
         elapsed = time.time() - self.start_time
-        row = ([elapsed, x_ee[0], x_ee[1], x_ee[2], h, cstr_pub, int(feasible),
-                gn_raw, circ_mag, correction_mag]
+        row = ([elapsed, x_ee[0], x_ee[1], x_ee[2], h, cstr_pub, 1,
+                gn_raw, 0.0, 0.0]
                + list(self.q) + list(dq) + list(ddq))
         with open(self.csv_filename, mode='a', newline='') as f:
             csv.writer(f).writerow(row)
 
         self.status_pub.publish(String(
             data=(f"ee=({x_ee[0]:+.3f},{x_ee[1]:+.3f},{x_ee[2]:+.3f}) "
-                  f"h={h:+.4f} cstr={cstr_pub:+.4f} circ={circ_mag:.3f} "
-                  f"gn={gn_raw:.1f} feas={int(feasible)} "
+                  f"h={h:+.4f} cstr={cstr_pub:+.4f} circ=0.000 "
+                  f"gn={gn_raw:.1f} feas=1 "
                   f"|e|={np.linalg.norm(e):.3f} |dq|={np.linalg.norm(dq):.3f}")))
 
 
